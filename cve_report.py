@@ -14,6 +14,8 @@ import argparse
 import json
 import sys
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,7 +31,18 @@ except ImportError:
 RHEL_CVE_URL  = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
 OSV_VULN_URL  = "https://api.osv.dev/v1/vulns/{vuln_id}"
 OSV_QUERY_URL = "https://api.osv.dev/v1/query"
-BDU_SEARCH_URL = "https://bdu.fstec.ru/web-api/vulnerabilities"
+# BDU FSTEC has no search API — provides a full XML dump updated several times/week
+BDU_XML_URL   = "https://bdu.fstec.ru/files/documents/vulxml.zip"
+BDU_CACHE_DIR  = Path.home() / ".cache" / "cve_report" / "bdu"
+BDU_CACHE_FILE = BDU_CACHE_DIR / "vulxml.zip"
+BDU_CACHE_TTL  = 86400  # seconds (24 h)
+
+BDU_SEVERITY_MAP = {
+    "критическая": "CRITICAL",
+    "высокая":     "HIGH",
+    "средняя":     "MEDIUM",
+    "низкая":      "LOW",
+}
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 
@@ -132,95 +145,186 @@ def fetch_osv(cve_id: str, session: requests.Session, timeout: int) -> dict:
     return result
 
 
-def fetch_bdu(cve_id: str, session: requests.Session, timeout: int) -> dict:
+def _bdu_ensure_cache(session: requests.Session, timeout: int,
+                      force_refresh: bool = False, verbose: bool = False) -> None:
+    """Download vulxml.zip if missing or older than BDU_CACHE_TTL."""
+    BDU_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if not force_refresh and BDU_CACHE_FILE.exists():
+        age = time.time() - BDU_CACHE_FILE.stat().st_mtime
+        if age < BDU_CACHE_TTL:
+            return
+    if verbose:
+        print("[*] Downloading BDU FSTEC XML dump (may take a while)…", file=sys.stderr)
+    resp = session.get(BDU_XML_URL, timeout=max(timeout, 120), stream=True)
+    resp.raise_for_status()
+    tmp = BDU_CACHE_FILE.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+    tmp.replace(BDU_CACHE_FILE)
+
+
+def _bdu_find_cve(cve_id: str) -> dict | None:
+    """
+    Parse the cached XML with iterparse to find the first vulnerability
+    whose <identifiers> contains a CVE-type entry matching cve_id.
+    Returns a dict of extracted fields, or None if not found.
+    Uses iterparse to avoid loading the full multi-MB XML into memory.
+    """
+    target = cve_id.upper()
+
+    with zipfile.ZipFile(BDU_CACHE_FILE) as z:
+        xml_names = [n for n in z.namelist() if n.endswith(".xml")]
+        if not xml_names:
+            raise ValueError("No XML file found inside BDU zip")
+        with z.open(xml_names[0]) as raw_stream:
+            # Stream-parse element by element; accumulate one <vul> at a time
+            vul: dict | None = None
+            found: dict | None = None
+            context = ET.iterparse(raw_stream, events=("start", "end"))
+            depth = 0  # nesting depth inside a <vul> element
+            current_tag = []  # path stack inside vul
+
+            for event, elem in context:
+                if event == "start":
+                    if depth == 0 and elem.tag not in ("export", "vulnerabilities"):
+                        # Every direct child of root is a vulnerability record
+                        vul = {
+                            "identifier": None, "name": None, "description": None,
+                            "severity": None, "solution": None, "identify_date": None,
+                            "exploit_status": None, "vul_incident": None,
+                            "cvss": {}, "cvss3": {}, "cwe": [], "soft": [],
+                            "identifiers": [],
+                        }
+                        depth = 1
+                    elif depth >= 1:
+                        depth += 1
+                elif event == "end":
+                    if vul is None:
+                        continue
+
+                    tag = elem.tag
+                    text = (elem.text or "").strip()
+
+                    if depth == 2:  # direct children of <vul>
+                        if tag == "identifier":
+                            vul["identifier"] = text
+                        elif tag == "name":
+                            vul["name"] = text
+                        elif tag == "description":
+                            vul["description"] = text
+                        elif tag == "severity":
+                            vul["severity"] = text
+                        elif tag == "solution":
+                            vul["solution"] = text
+                        elif tag == "identify_date":
+                            vul["identify_date"] = text
+                        elif tag == "exploit_status":
+                            vul["exploit_status"] = text
+                        elif tag == "vul_incident":
+                            vul["vul_incident"] = text
+                        elif tag == "identifiers":
+                            for ident in elem:
+                                vul["identifiers"].append({
+                                    "type":  ident.attrib.get("type", ""),
+                                    "value": (ident.text or "").strip(),
+                                })
+                        elif tag == "vulnerable_software":
+                            for soft in elem:
+                                sd = {sp.tag: (sp.text or "").strip() for sp in soft}
+                                vul["soft"].append(sd)
+                        elif tag == "cvss":
+                            for cp in elem:
+                                if cp.tag == "vector":
+                                    vul["cvss"] = {
+                                        "vector": (cp.text or "").strip(),
+                                        "score":  cp.attrib.get("score", "N/A"),
+                                    }
+                        elif tag == "cvss3":
+                            for cp in elem:
+                                if cp.tag == "vector":
+                                    vul["cvss3"] = {
+                                        "vector": (cp.text or "").strip(),
+                                        "score":  cp.attrib.get("score", "N/A"),
+                                    }
+                        elif tag == "cwe":
+                            vul["cwe"] = [(c.text or "").strip() for c in elem if c.text]
+
+                    if depth == 1:
+                        # Closing tag of the vulnerability record itself
+                        elem.clear()  # free memory
+                        depth = 0
+                        if vul is not None:
+                            cve_ids_in_vul = {
+                                i["value"].upper()
+                                for i in vul["identifiers"]
+                                if i["type"].upper() == "CVE"
+                            }
+                            if target in cve_ids_in_vul:
+                                found = vul
+                                break  # stop parsing — we found it
+                        vul = None
+                    else:
+                        depth -= 1
+
+            return found
+
+
+def fetch_bdu(cve_id: str, session: requests.Session, timeout: int,
+              force_refresh: bool = False, verbose: bool = False) -> dict:
     result = {"source": "BDU FSTEC", "cve_id": cve_id, "found": False, "error": None, "data": {}}
     try:
-        params = {"identcve": cve_id, "page": 1, "size": 5}
-        resp = session.get(BDU_SEARCH_URL, params=params, timeout=timeout)
-        resp.raise_for_status()
-        body = resp.json()
-
-        # BDU may return list or dict with "content"/"data" field
-        items = []
-        if isinstance(body, list):
-            items = body
-        elif isinstance(body, dict):
-            items = body.get("content", body.get("data", body.get("items", [])))
-
-        # Filter to exact CVE match by aliases / identifiers
-        matched = []
-        for item in items:
-            idents = _bdu_identifiers(item)
-            if cve_id.upper() in idents:
-                matched.append(item)
-
-        if not matched:
-            # Try broader: any item that mentions cve_id somewhere
-            matched = items[:1] if items else []
-
-        if not matched:
+        _bdu_ensure_cache(session, timeout, force_refresh=force_refresh, verbose=verbose)
+        raw = _bdu_find_cve(cve_id)
+        if raw is None:
             result["error"] = "Not found in BDU FSTEC database"
             return result
 
-        raw = matched[0]
-        bdu_id   = raw.get("id", raw.get("identifier", raw.get("bduId", "N/A")))
-        cvss3    = raw.get("cvss3", raw.get("cvssVector3", {}))
-        cvss2    = raw.get("cvss2", raw.get("cvssVector2", {}))
-        score3   = _extract_bdu_score(cvss3)
-        score2   = _extract_bdu_score(cvss2)
-        score    = score3 if score3 != "N/A" else score2
-        severity = _cvss_score_to_severity(score)
+        bdu_id  = raw.get("identifier") or "N/A"
+        score3  = raw.get("cvss3", {}).get("score", "N/A") or "N/A"
+        score2  = raw.get("cvss",  {}).get("score", "N/A") or "N/A"
+        score   = score3 if score3 not in ("N/A", "") else score2
+        sev_raw = (raw.get("severity") or "").strip().lower()
+        severity = BDU_SEVERITY_MAP.get(sev_raw, _cvss_score_to_severity(score))
+
+        cve_aliases = [
+            i["value"] for i in raw.get("identifiers", [])
+            if i["type"].upper() == "CVE" and i["value"]
+        ]
+        soft_list = [
+            " ".join(filter(None, [s.get("vendor", ""), s.get("name", ""), s.get("version", "")]))
+            for s in raw.get("soft", [])
+        ]
+        num_id = bdu_id.split(":")[-1] if ":" in bdu_id else bdu_id
 
         result["found"] = True
         result["data"] = {
-            "bdu_id":      f"BDU:{bdu_id}" if bdu_id != "N/A" and not str(bdu_id).startswith("BDU") else str(bdu_id),
-            "severity":    raw.get("severity", severity),
-            "cvss3_score": score3,
-            "cvss2_score": score2,
-            "summary":     raw.get("description", raw.get("name", raw.get("shortDescription", "N/A"))),
-            "published":   raw.get("identifyDate", raw.get("publishDate", raw.get("created", "N/A"))),
-            "updated":     raw.get("updateDate", raw.get("modified", "N/A")),
-            "affected_software": raw.get("affectedSoftware", raw.get("software", [])),
-            "identifiers": list(_bdu_identifiers(raw)),
-            "remediation": raw.get("solution", raw.get("remediation", raw.get("fix", "N/A"))),
-            "raw_url":     f"https://bdu.fstec.ru/vul/{bdu_id}" if bdu_id != "N/A" else "https://bdu.fstec.ru/",
+            "bdu_id":         bdu_id,
+            "severity":       severity,
+            "cvss3_score":    score3,
+            "cvss3_vector":   raw.get("cvss3", {}).get("vector", "N/A"),
+            "cvss2_score":    score2,
+            "cvss2_vector":   raw.get("cvss", {}).get("vector", "N/A"),
+            "summary":        raw.get("description") or raw.get("name") or "N/A",
+            "published":      raw.get("identify_date") or "N/A",
+            "exploit_status": raw.get("exploit_status") or "N/A",
+            "wild_exploited": raw.get("vul_incident") == "1",
+            "cwe":            raw.get("cwe", []),
+            "cve_aliases":    cve_aliases,
+            "affected_software": soft_list,
+            "remediation":    raw.get("solution") or "N/A",
+            "raw_url":        f"https://bdu.fstec.ru/vul/{num_id}",
         }
     except requests.exceptions.Timeout:
-        result["error"] = "Request timed out"
+        result["error"] = "Request timed out (BDU ZIP download)"
     except requests.exceptions.RequestException as e:
         result["error"] = str(e)
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, OSError) as e:
         result["error"] = f"Parse error: {e}"
     return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _bdu_identifiers(item: dict) -> set:
-    ids = set()
-    for key in ("cveId", "cve_id", "identCVE", "identifiers", "aliases"):
-        val = item.get(key)
-        if isinstance(val, str):
-            ids.add(val.upper())
-        elif isinstance(val, list):
-            for v in val:
-                if isinstance(v, str):
-                    ids.add(v.upper())
-                elif isinstance(v, dict):
-                    ids.add(v.get("identifier", v.get("value", "")).upper())
-    return ids
-
-
-def _extract_bdu_score(cvss) -> str:
-    if isinstance(cvss, dict):
-        for key in ("score", "baseScore", "base_score", "vector"):
-            val = cvss.get(key)
-            if val is not None:
-                return str(val)
-    if isinstance(cvss, (int, float)):
-        return str(cvss)
-    return "N/A"
-
 
 def _parse_cvss_score(vector: str) -> str:
     """Extract base score from CVSS vector string or return it if already numeric."""
@@ -478,24 +582,24 @@ def _render_bdu_panel(r: dict) -> str:
     if r["error"]:
         return f'<span class="dot dot-err"></span>BDU FSTEC</div><p class="error-msg">{r["error"]}</p>'
     d = r["data"]
-    sw = d.get("affected_software", [])
-    if isinstance(sw, list):
-        sw_tags = _tags([s if isinstance(s, str) else s.get("name", str(s)) for s in sw])
-    else:
-        sw_tags = str(sw)[:200]
+    exploit_html = d.get("exploit_status") or "N/A"
+    if d.get("wild_exploited"):
+        exploit_html = f'<span style="color:#ff4444;font-weight:700">{exploit_html} ⚠ exploited in wild</span>'
     rows = (
-        _kv("BDU ID",      d.get("bdu_id")) +
-        _kv("Severity",    _sev_badge(d.get("severity","UNKNOWN")), raw=True) +
-        _kv("CVSS3 Score", d.get("cvss3_score")) +
-        _kv("CVSS2 Score", d.get("cvss2_score")) +
-        _kv("Published",   d.get("published")) +
-        _kv("Updated",     d.get("updated")) +
-        _kv("Summary",     (d.get("summary","") or "")[:300]) +
-        _kv("Identifiers", _tags(d.get("identifiers", [])), raw=True) +
-        _kv("Affected SW", sw_tags, raw=True) +
-        _kv("Remediation", (d.get("remediation","") or "")[:300])
+        _kv("BDU ID",        d.get("bdu_id")) +
+        _kv("Severity",      _sev_badge(d.get("severity", "UNKNOWN")), raw=True) +
+        _kv("CVSS3 Score",   d.get("cvss3_score")) +
+        _kv("CVSS3 Vector",  (d.get("cvss3_vector") or "")[:80]) +
+        _kv("CVSS2 Score",   d.get("cvss2_score")) +
+        _kv("Published",     d.get("published")) +
+        _kv("Exploit",       exploit_html, raw=True) +
+        _kv("CWE",           _tags(d.get("cwe", [])), raw=True) +
+        _kv("Summary",       (d.get("summary") or "")[:300]) +
+        _kv("CVE aliases",   _tags(d.get("cve_aliases", [])), raw=True) +
+        _kv("Affected SW",   _tags(d.get("affected_software", [])), raw=True) +
+        _kv("Remediation",   (d.get("remediation") or "")[:300])
     )
-    link = d.get("raw_url","")
+    link = d.get("raw_url", "")
     return (f'<span class="dot dot-ok"></span>'
             f'BDU FSTEC &nbsp;<a href="{link}" target="_blank" rel="noopener">↗</a>'
             f'</div><table class="kv-table">{rows}</table>')
@@ -613,6 +717,8 @@ def main():
                         help="Skip OSV database")
     parser.add_argument("--no-bdu",  action="store_true",
                         help="Skip BDU FSTEC database")
+    parser.add_argument("--bdu-refresh", action="store_true",
+                        help="Force re-download of BDU FSTEC XML dump (ignores 24h cache)")
     parser.add_argument("--delay",  type=float, default=0.5,
                         help="Delay between requests in seconds (default: 0.5)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -643,13 +749,26 @@ def main():
     if not fetchers:
         parser.error("All sources disabled — nothing to fetch.")
 
+    # Pre-download BDU cache once before the per-CVE loop (avoids repeated downloads)
+    if not args.no_bdu:
+        try:
+            _bdu_ensure_cache(session, args.timeout,
+                              force_refresh=args.bdu_refresh, verbose=args.verbose)
+        except Exception as e:
+            print(f"[!] BDU cache download failed: {e}", file=sys.stderr)
+
     total = len(cve_ids) * len(fetchers)
     done  = 0
     for cve_id in cve_ids:
         all_results[cve_id] = []
         for name, fn in fetchers:
             log(f"[{done+1}/{total}] {cve_id} → {name}")
-            result = fn(cve_id, session, args.timeout)
+            if name == "BDU FSTEC":
+                # cache already warmed; pass force_refresh=False to skip re-download
+                result = fn(cve_id, session, args.timeout,
+                            force_refresh=False, verbose=args.verbose)
+            else:
+                result = fn(cve_id, session, args.timeout)
             all_results[cve_id].append(result)
             done += 1
             if args.delay > 0 and done < total:
