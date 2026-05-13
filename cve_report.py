@@ -164,7 +164,7 @@ def _bdu_ensure_cache(session: requests.Session, timeout: int,
     tmp.replace(BDU_CACHE_FILE)
 
 
-def _bdu_find_cve(cve_id: str) -> dict | None:
+def _bdu_find_cve(cve_id: str) -> Optional[dict]:
     """
     Parse the cached XML with iterparse to find the first vulnerability
     whose <identifiers> contains a CVE-type entry matching cve_id.
@@ -179,8 +179,8 @@ def _bdu_find_cve(cve_id: str) -> dict | None:
             raise ValueError("No XML file found inside BDU zip")
         with z.open(xml_names[0]) as raw_stream:
             # Stream-parse element by element; accumulate one <vul> at a time
-            vul: dict | None = None
-            found: dict | None = None
+            vul: Optional[dict] = None
+            found: Optional[dict] = None
             context = ET.iterparse(raw_stream, events=("start", "end"))
             depth = 0  # nesting depth inside a <vul> element
             current_tag = []  # path stack inside vul
@@ -359,7 +359,7 @@ def _cvss_score_to_severity(score) -> str:
     return "UNKNOWN"
 
 
-def _overall_severity(results: list[dict]) -> str:
+def _overall_severity(results: "list[dict]") -> str:
     best = "UNKNOWN"
     for r in results:
         if not r["found"]:
@@ -732,7 +732,7 @@ def main():
             parser.error(f"Invalid CVE identifier: {cid!r}  (expected CVE-YYYY-NNNNN)")
 
     session = build_session(args.timeout)
-    all_results: dict[str, list[dict]] = {}
+    all_results = {}  # type: dict[str, list[dict]]
 
     def log(msg):
         if args.verbose:
