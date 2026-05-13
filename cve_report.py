@@ -289,11 +289,11 @@ CSS = """
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--text); font-family: var(--font);
-       font-size: 14px; line-height: 1.6; padding: 24px; }
+       font-size: 14px; line-height: 1.6; padding: 24px; min-width: 0; }
 h1   { font-size: 1.6rem; color: #e6edf3; margin-bottom: 4px; }
 h2   { font-size: 1.1rem; color: var(--accent); margin: 20px 0 10px; }
 h3   { font-size: 1rem; color: #e6edf3; margin-bottom: 8px; }
-a    { color: var(--accent); text-decoration: none; }
+a    { color: var(--accent); text-decoration: none; word-break: break-all; }
 a:hover { text-decoration: underline; }
 
 .header { border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; }
@@ -301,7 +301,7 @@ a:hover { text-decoration: underline; }
 
 .summary-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
     gap: 12px;
     margin-bottom: 32px;
 }
@@ -310,6 +310,7 @@ a:hover { text-decoration: underline; }
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 14px 18px;
+    min-width: 0;
 }
 .stat-card .label { color: var(--text-dim); font-size: 0.78rem; text-transform: uppercase;
                     letter-spacing: .05em; margin-bottom: 4px; }
@@ -321,11 +322,13 @@ a:hover { text-decoration: underline; }
     border-radius: 10px;
     margin-bottom: 24px;
     overflow: hidden;
+    min-width: 0;
 }
 .cve-header {
     display: flex;
     align-items: center;
-    gap: 12px;
+    flex-wrap: wrap;
+    gap: 10px;
     padding: 14px 20px;
     border-bottom: 1px solid var(--border);
     background: #1c2128;
@@ -334,39 +337,72 @@ a:hover { text-decoration: underline; }
 .sev-badge {
     font-size: 0.75rem; font-weight: 700; letter-spacing: .06em;
     padding: 3px 10px; border-radius: 12px; text-transform: uppercase;
+    white-space: nowrap;
 }
+
+/* Панели источников — вертикальный стек, каждая на всю ширину */
 .sources-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 0;
+    display: flex;
+    flex-direction: column;
 }
 .source-panel {
     padding: 16px 20px;
-    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    min-width: 0;
 }
-.source-panel:last-child { border-right: none; }
+.source-panel:last-child { border-bottom: none; }
+
 .source-name {
     font-size: 0.7rem; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--text-dim); margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+    color: var(--text-dim); margin-bottom: 10px;
+    display: flex; align-items: center; gap: 6px;
 }
-.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dot-ok  { background: #3fb950; }
 .dot-err { background: #f85149; }
 .dot-na  { background: #6e7681; }
-.kv-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
-.kv-table td { padding: 3px 0; vertical-align: top; }
-.kv-table td:first-child { color: var(--text-dim); width: 42%; padding-right: 8px;
-                            white-space: nowrap; }
-.tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+
+/* Таблица ключ-значение */
+.kv-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; table-layout: fixed; }
+.kv-table td { padding: 4px 0; vertical-align: top; word-break: break-word; overflow-wrap: break-word; }
+.kv-table td:first-child {
+    color: var(--text-dim);
+    width: 130px;
+    min-width: 130px;
+    max-width: 130px;
+    padding-right: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.kv-table td:last-child { min-width: 0; }
+
+.tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
 .tag { background: #21262d; border: 1px solid var(--border); border-radius: 4px;
-       font-size: 0.75rem; padding: 1px 7px; font-family: var(--mono); color: var(--text-dim); }
-.ref-list { list-style: none; margin-top: 4px; }
-.ref-list li { word-break: break-all; font-size: 0.8rem; padding: 1px 0; }
+       font-size: 0.75rem; padding: 1px 7px; font-family: var(--mono); color: var(--text-dim);
+       word-break: break-all; max-width: 100%; }
+.ref-list { list-style: none; margin-top: 2px; }
+.ref-list li { word-break: break-all; overflow-wrap: break-word; font-size: 0.8rem; padding: 2px 0; }
 .error-msg { color: #f85149; font-size: 0.82rem; font-style: italic; }
 .not-found { color: var(--text-dim); font-size: 0.82rem; }
 
 .footer { border-top: 1px solid var(--border); margin-top: 32px; padding-top: 14px;
           color: var(--text-dim); font-size: 0.8rem; }
+
+@media (min-width: 900px) {
+    /* На широких экранах — три колонки рядом */
+    .sources-grid {
+        flex-direction: row;
+        align-items: stretch;
+    }
+    .source-panel {
+        flex: 1 1 0;
+        min-width: 0;
+        border-bottom: none;
+        border-right: 1px solid var(--border);
+    }
+    .source-panel:last-child { border-right: none; }
+}
 """
 
 def _sev_badge(sev: str) -> str:
