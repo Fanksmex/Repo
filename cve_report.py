@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import html as _html
 import json
 import sys
 import time
@@ -58,12 +59,15 @@ def fetch_rhel(cve_id: str, session: requests.Session, timeout: int) -> dict:
         resp.raise_for_status()
         raw = resp.json()
         result["found"] = True
+        cvss3 = raw.get("cvss3") or {}
+        cvss2 = raw.get("cvss")  or {}
+        bugzilla = raw.get("bugzilla") or {}
         result["data"] = {
-            "severity":    raw.get("threat_severity", "UNKNOWN").upper(),
-            "cvss3_score": raw.get("cvss3", {}).get("cvss3_base_score", "N/A"),
-            "cvss3_vector":raw.get("cvss3", {}).get("cvss3_scoring_vector", "N/A"),
-            "cvss2_score": raw.get("cvss", {}).get("cvss_base_score", "N/A"),
-            "summary":     raw.get("details", raw.get("bugzilla", {}).get("description", "N/A")),
+            "severity":    (raw.get("threat_severity") or "UNKNOWN").upper(),
+            "cvss3_score": cvss3.get("cvss3_base_score", "N/A"),
+            "cvss3_vector":cvss3.get("cvss3_scoring_vector", "N/A"),
+            "cvss2_score": cvss2.get("cvss_base_score", "N/A"),
+            "summary":     raw.get("details") or bugzilla.get("description") or "N/A",
             "public_date": raw.get("public_date", "N/A"),
             "cwe":         raw.get("cwe", "N/A"),
             "affected_packages": [
@@ -102,17 +106,24 @@ def fetch_osv(cve_id: str, session: requests.Session, timeout: int) -> dict:
             raw = vulns[0]
 
         result["found"] = True
-        severity_list = raw.get("severity", [])
+        severity_list = raw.get("severity") or []
         cvss_score, cvss_vector, severity_label = "N/A", "N/A", "UNKNOWN"
         for s in severity_list:
-            if s.get("type") == "CVSS_V3":
+            stype = s.get("type", "")
+            if stype == "CVSS_V3":
                 cvss_vector = s.get("score", "N/A")
-                cvss_score  = _parse_cvss_score(cvss_vector)
-                severity_label = _cvss_score_to_severity(cvss_score)
-            elif s.get("type") == "CVSS_V2" and cvss_score == "N/A":
+                # OSV stores the full CVSS vector string, not a numeric score
+                cvss_score = "N/A"
+                break
+            elif stype == "CVSS_V2" and cvss_vector == "N/A":
                 cvss_vector = s.get("score", "N/A")
-                cvss_score  = _parse_cvss_score(cvss_vector)
-                severity_label = _cvss_score_to_severity(cvss_score)
+        # OSV embeds NVD severity label in database_specific
+        db_spec = raw.get("database_specific") or {}
+        sev_label = (db_spec.get("severity") or "").upper()
+        if sev_label in SEVERITY_ORDER:
+            severity_label = sev_label
+        elif cvss_vector != "N/A":
+            severity_label = _severity_from_cvss_vector(cvss_vector)
 
         aliases  = raw.get("aliases", [])
         refs     = [r.get("url", "") for r in raw.get("references", [])][:10]
@@ -178,17 +189,19 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
         if not xml_names:
             raise ValueError("No XML file found inside BDU zip")
         with z.open(xml_names[0]) as raw_stream:
-            # Stream-parse element by element; accumulate one <vul> at a time
             vul: Optional[dict] = None
             found: Optional[dict] = None
-            context = ET.iterparse(raw_stream, events=("start", "end"))
-            depth = 0  # nesting depth inside a <vul> element
-            current_tag = []  # path stack inside vul
+            # abs_depth: absolute nesting level in the XML document
+            #   0  = before document starts
+            #   1  = root element  (<export> / whatever)
+            #   2  = direct child of root = one vulnerability record
+            #   3+ = fields and sub-fields inside a record
+            abs_depth = 0
 
-            for event, elem in context:
+            for event, elem in ET.iterparse(raw_stream, events=("start", "end")):
                 if event == "start":
-                    if depth == 0 and elem.tag not in ("export", "vulnerabilities"):
-                        # Every direct child of root is a vulnerability record
+                    abs_depth += 1
+                    if abs_depth == 2:
                         vul = {
                             "identifier": None, "name": None, "description": None,
                             "severity": None, "solution": None, "identify_date": None,
@@ -196,17 +209,12 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
                             "cvss": {}, "cvss3": {}, "cwe": [], "soft": [],
                             "identifiers": [],
                         }
-                        depth = 1
-                    elif depth >= 1:
-                        depth += 1
+
                 elif event == "end":
-                    if vul is None:
-                        continue
-
-                    tag = elem.tag
-                    text = (elem.text or "").strip()
-
-                    if depth == 2:  # direct children of <vul>
+                    if abs_depth == 3 and vul is not None:
+                        # direct field of the current vulnerability record
+                        tag  = elem.tag
+                        text = (elem.text or "").strip()
                         if tag == "identifier":
                             vul["identifier"] = text
                         elif tag == "name":
@@ -231,8 +239,9 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
                                 })
                         elif tag == "vulnerable_software":
                             for soft in elem:
-                                sd = {sp.tag: (sp.text or "").strip() for sp in soft}
-                                vul["soft"].append(sd)
+                                vul["soft"].append(
+                                    {sp.tag: (sp.text or "").strip() for sp in soft}
+                                )
                         elif tag == "cvss":
                             for cp in elem:
                                 if cp.tag == "vector":
@@ -250,22 +259,20 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
                         elif tag == "cwe":
                             vul["cwe"] = [(c.text or "").strip() for c in elem if c.text]
 
-                    if depth == 1:
-                        # Closing tag of the vulnerability record itself
-                        elem.clear()  # free memory
-                        depth = 0
-                        if vul is not None:
-                            cve_ids_in_vul = {
-                                i["value"].upper()
-                                for i in vul["identifiers"]
-                                if i["type"].upper() == "CVE"
-                            }
-                            if target in cve_ids_in_vul:
-                                found = vul
-                                break  # stop parsing — we found it
+                    elif abs_depth == 2 and vul is not None:
+                        # closing tag of the vulnerability record
+                        elem.clear()
+                        cve_ids_in_vul = {
+                            i["value"].upper()
+                            for i in vul["identifiers"]
+                            if i["type"].upper() == "CVE"
+                        }
+                        if target in cve_ids_in_vul:
+                            found = vul
+                            break
                         vul = None
-                    else:
-                        depth -= 1
+
+                    abs_depth -= 1
 
             return found
 
@@ -326,21 +333,40 @@ def fetch_bdu(cve_id: str, session: requests.Session, timeout: int,
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _parse_cvss_score(vector: str) -> str:
-    """Extract base score from CVSS vector string or return it if already numeric."""
-    if not vector or vector == "N/A":
+def _parse_cvss_score(value: str) -> str:
+    """Return numeric base score string if value is numeric, else N/A."""
+    if not value or value == "N/A":
         return "N/A"
     try:
-        score = float(vector)
-        return f"{score:.1f}"
-    except ValueError:
-        pass
-    # Some OSV entries embed score as "CVSS:3.1/AV:N/..."
-    parts = vector.split("/")
-    for part in parts:
-        if part.startswith("BS:") or part.startswith("baseScore:"):
-            return part.split(":")[1]
-    return "N/A"
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _severity_from_cvss_vector(vector: str) -> str:
+    """
+    Estimate severity from a CVSS v3 vector string without full calculation.
+    Parses component values to classify into standard severity bands.
+    """
+    if not vector or "AV:" not in vector:
+        return "UNKNOWN"
+    parts = {p.split(":")[0]: p.split(":")[1] for p in vector.split("/") if ":" in p}
+    c = parts.get("C", "N")
+    i = parts.get("I", "N")
+    a = parts.get("A", "N")
+    av = parts.get("AV", "L")
+    pr = parts.get("PR", "H")
+    s  = parts.get("S", "U")
+    # All three impacts High + network-reachable → Critical
+    if c == "H" and i == "H" and a == "H" and av == "N":
+        return "CRITICAL"
+    if c == "H" and i == "H" and av == "N":
+        return "CRITICAL"
+    if (c == "H" or i == "H" or a == "H") and av in ("N", "A") and pr in ("N", "L"):
+        return "HIGH"
+    if c in ("H", "L") or i in ("H", "L") or a in ("H", "L"):
+        return "MEDIUM"
+    return "LOW"
 
 
 def _cvss_score_to_severity(score) -> str:
@@ -514,26 +540,35 @@ def _sev_badge(sev: str) -> str:
     return f'<span class="sev-badge" style="background:{bg};color:{fg}">{sev}</span>'
 
 
+def _esc(s) -> str:
+    return _html.escape(str(s), quote=False)
+
+
 def _tags(items) -> str:
     if not items:
         return '<span class="not-found">—</span>'
-    return '<div class="tag-list">' + "".join(f'<span class="tag">{i}</span>' for i in items[:15]) + "</div>"
+    return '<div class="tag-list">' + "".join(
+        f'<span class="tag">{_esc(i)}</span>' for i in items[:15]
+    ) + "</div>"
 
 
 def _refs(urls) -> str:
     if not urls:
         return '<span class="not-found">—</span>'
-    items = "".join(f'<li><a href="{u}" target="_blank" rel="noopener">{u}</a></li>' for u in urls)
-    return f'<ul class="ref-list">{items}</ul>'
+    parts = "".join(
+        f'<li><a href="{_html.escape(u, quote=True)}" target="_blank" rel="noopener">{_esc(u)}</a></li>'
+        for u in urls
+    )
+    return f'<ul class="ref-list">{parts}</ul>'
 
 
 def _kv(label: str, value, raw: bool = False) -> str:
     if value is None or value == "N/A" or value == [] or value == "":
         value_html = '<span class="not-found">N/A</span>'
     elif raw:
-        value_html = str(value)
+        value_html = str(value)          # caller supplies safe HTML (badges, tags, refs)
     else:
-        value_html = str(value)
+        value_html = _esc(value)         # plain text — escape before inserting
     return f"<tr><td>{label}</td><td>{value_html}</td></tr>"
 
 
