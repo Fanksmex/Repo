@@ -159,6 +159,8 @@ def fetch_osv(cve_id: str, session: requests.Session, timeout: int) -> dict:
 def _bdu_ensure_cache(session: requests.Session, timeout: int,
                       force_refresh: bool = False, verbose: bool = False) -> None:
     """Download vulxml.zip if missing or older than BDU_CACHE_TTL."""
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     BDU_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if not force_refresh and BDU_CACHE_FILE.exists():
         age = time.time() - BDU_CACHE_FILE.stat().st_mtime
@@ -172,8 +174,9 @@ def _bdu_ensure_cache(session: requests.Session, timeout: int,
         "Accept": "application/zip, application/octet-stream, */*",
         "Referer": "https://bdu.fstec.ru/",
     }
+    # bdu.fstec.ru uses a Russian Ministry CA not trusted by default OpenSSL bundles
     resp = session.get(BDU_XML_URL, timeout=max(timeout, 120), stream=True,
-                       headers=bdu_headers)
+                       headers=bdu_headers, verify=False)
     resp.raise_for_status()
     tmp = BDU_CACHE_FILE.with_suffix(".tmp")
     with open(tmp, "wb") as f:
