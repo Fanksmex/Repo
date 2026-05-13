@@ -166,13 +166,30 @@ def _bdu_ensure_cache(session: requests.Session, timeout: int,
             return
     if verbose:
         print("[*] Downloading BDU FSTEC XML dump (may take a while)…", file=sys.stderr)
-    resp = session.get(BDU_XML_URL, timeout=max(timeout, 120), stream=True)
+    # BDU requires a browser-like UA and does not accept application/json
+    bdu_headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Accept": "application/zip, application/octet-stream, */*",
+        "Referer": "https://bdu.fstec.ru/",
+    }
+    resp = session.get(BDU_XML_URL, timeout=max(timeout, 120), stream=True,
+                       headers=bdu_headers)
     resp.raise_for_status()
     tmp = BDU_CACHE_FILE.with_suffix(".tmp")
     with open(tmp, "wb") as f:
         for chunk in resp.iter_content(chunk_size=65536):
             f.write(chunk)
     tmp.replace(BDU_CACHE_FILE)
+
+
+def _normalize_cve_id(s: str) -> str:
+    """Normalize Unicode dashes that BDU sometimes uses instead of ASCII hyphens."""
+    return (s.replace("‑", "-")   # non-breaking hyphen
+             .replace("–", "-")   # en-dash
+             .replace("‒", "-")   # figure dash
+             .replace("​", "")    # zero-width space
+             .strip()
+             .upper())
 
 
 def _bdu_find_cve(cve_id: str) -> Optional[dict]:
@@ -182,7 +199,7 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
     Returns a dict of extracted fields, or None if not found.
     Uses iterparse to avoid loading the full multi-MB XML into memory.
     """
-    target = cve_id.upper()
+    target = _normalize_cve_id(cve_id)
 
     with zipfile.ZipFile(BDU_CACHE_FILE) as z:
         xml_names = [n for n in z.namelist() if n.endswith(".xml")]
@@ -263,9 +280,9 @@ def _bdu_find_cve(cve_id: str) -> Optional[dict]:
                         # closing tag of the vulnerability record
                         elem.clear()
                         cve_ids_in_vul = {
-                            i["value"].upper()
+                            _normalize_cve_id(i["value"])
                             for i in vul["identifiers"]
-                            if i["type"].upper() == "CVE"
+                            if i["type"].upper() == "CVE" and i["value"]
                         }
                         if target in cve_ids_in_vul:
                             found = vul
