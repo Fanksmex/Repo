@@ -11,8 +11,8 @@ Usage:
 """
 
 import argparse
+import functools
 import html as _html
-import json
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -94,8 +94,8 @@ def fetch_osv(cve_id: str, session: requests.Session, timeout: int) -> dict:
         resp = session.get(OSV_VULN_URL.format(vuln_id=cve_id), timeout=timeout)
         if resp.status_code == 200:
             raw = resp.json()
-        else:
-            # Fall back to query endpoint
+        elif resp.status_code == 404:
+            # CVE not found by direct ID — try the query endpoint
             payload = {"query": {"id": cve_id}}
             resp2 = session.post(OSV_QUERY_URL, json=payload, timeout=timeout)
             resp2.raise_for_status()
@@ -104,6 +104,9 @@ def fetch_osv(cve_id: str, session: requests.Session, timeout: int) -> dict:
                 result["error"] = "Not found in OSV database"
                 return result
             raw = vulns[0]
+        else:
+            resp.raise_for_status()
+            return result  # unreachable, raise_for_status throws
 
         result["found"] = True
         severity_list = raw.get("severity") or []
@@ -353,16 +356,6 @@ def fetch_bdu(cve_id: str, session: requests.Session, timeout: int,
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _parse_cvss_score(value: str) -> str:
-    """Return numeric base score string if value is numeric, else N/A."""
-    if not value or value == "N/A":
-        return "N/A"
-    try:
-        return f"{float(value):.1f}"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
 def _severity_from_cvss_vector(vector: str) -> str:
     """
     Estimate severity from a CVSS v3 vector string without full calculation.
@@ -371,15 +364,13 @@ def _severity_from_cvss_vector(vector: str) -> str:
     if not vector or "AV:" not in vector:
         return "UNKNOWN"
     parts = {p.split(":")[0]: p.split(":")[1] for p in vector.split("/") if ":" in p}
-    c = parts.get("C", "N")
-    i = parts.get("I", "N")
-    a = parts.get("A", "N")
+    c  = parts.get("C", "N")
+    i  = parts.get("I", "N")
+    a  = parts.get("A", "N")
     av = parts.get("AV", "L")
     pr = parts.get("PR", "H")
-    s  = parts.get("S", "U")
-    # All three impacts High + network-reachable → Critical
-    if c == "H" and i == "H" and a == "H" and av == "N":
-        return "CRITICAL"
+    if c == "N" and i == "N" and a == "N":
+        return "UNKNOWN"
     if c == "H" and i == "H" and av == "N":
         return "CRITICAL"
     if (c == "H" or i == "H" or a == "H") and av in ("N", "A") and pr in ("N", "L"):
@@ -637,7 +628,7 @@ def _render_bdu_panel(r: dict) -> str:
     if r["error"]:
         return f'<span class="dot dot-err"></span>BDU FSTEC</div><p class="error-msg">{r["error"]}</p>'
     d = r["data"]
-    exploit_html = d.get("exploit_status") or "N/A"
+    exploit_html = _esc(d.get("exploit_status") or "N/A")
     if d.get("wild_exploited"):
         exploit_html = f'<span style="color:#ff4444;font-weight:700">{exploit_html} ⚠ exploited in wild</span>'
     rows = (
@@ -702,8 +693,7 @@ def generate_html(all_results: dict, args) -> str:
     cve_blocks = ""
     for cve_id, results in all_results.items():
         overall_sev = _overall_severity(results)
-        bg, fg = SEV_COLORS.get(overall_sev, SEV_COLORS["UNKNOWN"])
-        badge   = _sev_badge(overall_sev)
+        badge = _sev_badge(overall_sev)
         panels  = ""
         for r in results:
             renderer = _PANEL_RENDERERS.get(r["source"])
@@ -799,18 +789,17 @@ def main():
     if not args.no_osv:
         fetchers.append(("OSV",       fetch_osv))
     if not args.no_bdu:
-        fetchers.append(("BDU FSTEC", fetch_bdu))
-
-    if not fetchers:
-        parser.error("All sources disabled — nothing to fetch.")
-
-    # Pre-download BDU cache once before the per-CVE loop (avoids repeated downloads)
-    if not args.no_bdu:
+        # Warm BDU cache once up front; bind force_refresh/verbose into the callable
         try:
             _bdu_ensure_cache(session, args.timeout,
                               force_refresh=args.bdu_refresh, verbose=args.verbose)
         except Exception as e:
             print(f"[!] BDU cache download failed: {e}", file=sys.stderr)
+        bdu_fn = functools.partial(fetch_bdu, force_refresh=False, verbose=args.verbose)
+        fetchers.append(("BDU FSTEC", bdu_fn))
+
+    if not fetchers:
+        parser.error("All sources disabled — nothing to fetch.")
 
     total = len(cve_ids) * len(fetchers)
     done  = 0
@@ -818,12 +807,7 @@ def main():
         all_results[cve_id] = []
         for name, fn in fetchers:
             log(f"[{done+1}/{total}] {cve_id} → {name}")
-            if name == "BDU FSTEC":
-                # cache already warmed; pass force_refresh=False to skip re-download
-                result = fn(cve_id, session, args.timeout,
-                            force_refresh=False, verbose=args.verbose)
-            else:
-                result = fn(cve_id, session, args.timeout)
+            result = fn(cve_id, session, args.timeout)
             all_results[cve_id].append(result)
             done += 1
             if args.delay > 0 and done < total:
